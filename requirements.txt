@@ -1,0 +1,7 @@
+aiogram
+apscheduler
+google-api-python-client
+google-auth-oauthlib
+beautifulsoup4
+requests
+tzdata
