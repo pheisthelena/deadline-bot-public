@@ -1,42 +1,29 @@
-"""Телеграм-бот: дедлайны из Google Classroom и с wiki-страницы Calculus 2.
-
-Установка:
-    pip install aiogram apscheduler google-api-python-client google-auth-oauthlib beautifulsoup4
-
-Настройки (BOT_TOKEN, CHAT_ID, SMARTLMS_ICS) лежат в файле config.env рядом с ботом,
-по одной на строку в виде ИМЯ=значение. Команды export больше не нужны.
-
-Запуск:
-    python deadline_bot.py
-
-Рядом с файлом должны лежать config.env, credentials.json и token.json.
-"""
-
 import asyncio
+import hashlib
 import json
 import os
 import re
 import sys
+import threading
 import traceback
 from datetime import datetime, timedelta, timezone
 from html import escape
 from zoneinfo import ZoneInfo
 
 import requests
-from aiogram import Bot, Dispatcher
+from aiogram import Bot, Dispatcher, F
 from aiogram.filters import JOIN_TRANSITION, ChatMemberUpdatedFilter, Command, CommandObject
-from aiogram.types import BotCommand, ChatMemberUpdated, Message
+from aiogram.types import BotCommand, BufferedInputFile, ChatMemberUpdated, Message
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from bs4 import BeautifulSoup
+from google.auth.exceptions import RefreshError
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 
-# ---------- Настройки ----------
 
 def load_config(path="config.env"):
-    """Читает настройки из файла config.env (строки вида ИМЯ=значение)."""
     if not os.path.exists(path):
         return
     with open(path, encoding="utf-8") as f:
@@ -45,68 +32,55 @@ def load_config(path="config.env"):
             if not line or line.startswith("#") or "=" not in line:
                 continue
             key, value = line.split("=", 1)
-            # если переменная уже задана снаружи (export или панель хостинга), она главнее
             os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
 
 
 load_config()
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
-# Папка для файлов, которые бот создаёт сам (на хостинге это /app/data)
 DATA_DIR = os.environ.get("DATA_DIR") or ("/app/data" if os.path.isdir("/app/data") else ".")
 os.makedirs(DATA_DIR, exist_ok=True)
-# "Тихие" чаты: бот в них только читает сообщения и НИКОГДА ничего не пишет.
-# В config.env: SILENT_CHATS=-1001234567890:ADS,-1009876543210:Python  (id чата:название предмета)
 SILENT_CHATS = {}
 for _part in os.environ.get("SILENT_CHATS", "").split(","):
     if ":" in _part:
         _cid, _label = _part.split(":", 1)
         SILENT_CHATS[int(_cid.strip())] = _label.strip()
-# Чаты, которым бот отвечает и пишет о новых дедлайнах (личный чат и/или чат группы)
 _chat_list = [int(x) for x in os.environ.get("CHAT_ID", "").split(",") if x.strip()]
-CHAT_IDS = set(_chat_list) - set(SILENT_CHATS)  # тихий чат главнее: туда не пишем никогда
-# Владелец бота: ему в личку приходят служебные сообщения (id новых чатов и т.п.)
+CHAT_IDS = set(_chat_list) - set(SILENT_CHATS)
 OWNER_ID = int(os.environ.get("OWNER_ID") or next((c for c in _chat_list if c > 0), 0))
 TZ = ZoneInfo("Europe/Moscow")
-CHECK_MINUTES = 120  # как часто проверять, не появились ли новые дедлайны
-# True: команду /deadlines может вызвать кто угодно (например, одногруппник в личке с ботом).
-# False: бот отвечает только в чатах из CHAT_ID.
-# Добавлять и удалять дедлайны в любом случае можно только в чатах из CHAT_ID.
+REPO_URL = "https://github.com/pheisthelena/deadline-bot-public"
+CHECK_MINUTES = 120
 PUBLIC_DEADLINES = True
-# Сколько дней держать в списке задание из чата, если срок сдачи в сообщении не найден
 NO_DUE_DAYS = 14
+ADMINS_ONLY = True
+BACKUP_HOUR = 22
 
-# Wiki-страница лектора по Calculus 2
 WIKI_URL = "https://wiki.cs.hse.ru/Calculus_2_DSBA_2026/2027"
-WIKI_GROUP = "253"            # столбец таблицы Homework
+WIKI_GROUP = "253"
 WIKI_COURSE_NAME = "Calculus 2"
 
-# SmartLMS: личная ссылка на экспорт календаря (в ней секретный ключ, в код не вставляем)
 SMARTLMS_ICS = os.environ.get("SMARTLMS_ICS", "")
-# Какие курсы SmartLMS показывать: начало кода курса (поле CATEGORIES) -> название
 SMARTLMS_COURSES = {
     "1125760": "Economics",
 }
 
-# Как узнать курсы в Classroom: кусочки названия (регистр не важен)
 CALCULUS_KEYS = ("calculus", "калькулюс", "матан", "математический анализ")
 DM_KEYS = ("discrete", "дискрет", "dm2", "dm 2", "дм2", "дм 2")
-EXCLUDE_KEYS = ("english", "263")    # курсы, которые не показываем (есть не у всей группы)
-DM_MAX_DAYS = 8               # по ДМ2 показываем домашки со сроком через 7 дней и ближе
+EXCLUDE_KEYS = ("english", "263")
+DM_MAX_DAYS = 8
 
 SCOPES = [
     "https://www.googleapis.com/auth/classroom.courses.readonly",
     "https://www.googleapis.com/auth/classroom.student-submissions.me.readonly",
 ]
 
-# сайты ВШЭ отвечают 403 на запросы без "браузерных" заголовков
 BROWSER_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
                   "(KHTML, like Gecko) Chrome/126.0 Safari/537.36",
     "Accept-Language": "ru,en;q=0.8",
 }
 
-# SmartLMS дописывает к названию "- надо сдать" / "закрывается"; "открывается" - не дедлайн
 LMS_SUFFIX_RE = re.compile(r"\s*(?:-\s*надо сдать|закрывается|is due|closes)\s*$", re.IGNORECASE)
 LMS_OPENS_RE = re.compile(r"(?:открывается|opens)\s*$", re.IGNORECASE)
 
@@ -117,7 +91,6 @@ HW_NUMBER_RE = re.compile(
 
 
 def hw_number(title):
-    """Номер домашки из названия: 'HW_5', 'ДЗ 5', 'Homework 5' -> 5; иначе None."""
     m = HW_NUMBER_RE.search(title)
     return int(m.group(1)) if m else None
 
@@ -127,37 +100,53 @@ def has_key(name, keys):
     return any(k in name for k in keys)
 
 
-# ---------- Google Classroom ----------
+TOKEN_FILE = "token.json"
+_creds = None
+_creds_lock = threading.Lock()
+
+
+def save_token(creds):
+    tmp = TOKEN_FILE + ".tmp"
+    try:
+        with open(tmp, "w") as f:
+            f.write(creds.to_json())
+        os.replace(tmp, TOKEN_FILE)
+    except OSError:
+        pass
+
 
 def get_service():
-    """Возвращает клиент Classroom API; при первом запуске открывает вход в Google."""
-    creds = None
-    if os.path.exists("token.json"):
-        creds = Credentials.from_authorized_user_file("token.json", SCOPES)
-    if creds and not creds.valid and creds.refresh_token:
-        try:
-            creds.refresh(Request())  # обычное продление входа, без браузера
-        except Exception:
-            creds = None  # вход истёк или отозван, нужен новый
-    if not creds or not creds.valid:
-        if not sys.stdin.isatty():
-            # на сервере браузера нет: войти заново можно только на своём компьютере
-            raise RuntimeError("вход в Google истёк, нужен новый token.json")
-        flow = InstalledAppFlow.from_client_secrets_file("credentials.json", SCOPES)
-        creds = flow.run_local_server(port=0)
-    try:
-        with open("token.json", "w") as f:
-            f.write(creds.to_json())
-    except OSError:
-        pass  # на сервере файл может быть только для чтения, это не страшно
-    return build("classroom", "v1", credentials=creds)
+    global _creds
+    with _creds_lock:
+        creds = _creds
+        broken_file = False
+        if creds is None and os.path.exists(TOKEN_FILE):
+            try:
+                creds = Credentials.from_authorized_user_file(TOKEN_FILE, SCOPES)
+            except ValueError:
+                broken_file = True
+        if creds and not creds.valid and creds.refresh_token:
+            try:
+                creds.refresh(Request())
+                save_token(creds)
+            except RefreshError:
+                creds = None
+        if not creds or not creds.valid:
+            if not sys.stdin.isatty():
+                if broken_file:
+                    raise RuntimeError("файл token.json повреждён: пересобери бота в Bothost, "
+                                       "а если не поможет, загрузи новый token.json")
+                raise RuntimeError("вход в Google истёк, нужен новый token.json")
+            flow = InstalledAppFlow.from_client_secrets_file("credentials.json", SCOPES)
+            creds = flow.run_local_server(port=0)
+            save_token(creds)
+        _creds = creds
+    return build("classroom", "v1", credentials=creds, cache_discovery=False)
 
 
 def list_all(method, key, **params):
-    """Собирает все страницы ответа API в один список."""
     items, token = [], None
     while True:
-        # num_retries: при временной ошибке Google (5xx) запрос повторяется с паузой
         resp = method(pageToken=token, **params).execute(num_retries=4)
         items += resp.get(key, [])
         token = resp.get("nextPageToken")
@@ -166,11 +155,6 @@ def list_all(method, key, **params):
 
 
 def fetch_classroom(now):
-    """Задания из Classroom с будущим сроком (сданные тоже остаются в списке).
-
-    Дополнительно возвращает номера и даты показанных заданий курса Calculus,
-    чтобы не дублировать их домашками с wiki.
-    """
     svc = get_service()
     items, calc_numbers, calc_dates = [], set(), set()
     courses = list_all(svc.courses().list, "courses",
@@ -188,17 +172,14 @@ def fetch_classroom(now):
             due = None
             if "dueDate" in w:
                 d, t = w["dueDate"], w.get("dueTime", {})
-                # API отдаёт срок в UTC, переводим в московское время
                 due = datetime(d["year"], d["month"], d["day"],
                                t.get("hours", 0), t.get("minutes", 0),
                                tzinfo=timezone.utc).astimezone(TZ)
             if due is None or due < now:
-                continue  # без срока или срок уже прошёл
+                continue
             if is_dm and (due.date() - now.date()).days >= DM_MAX_DAYS:
-                continue  # по ДМ2 далёкие домашки пока не показываем
+                continue
             if is_calc:
-                # запоминаем только то, что реально попало в сводку:
-                # домашка с wiki скрывается, только если она уже есть в списке
                 number = hw_number(w["title"])
                 if number is not None:
                     calc_numbers.add(number)
@@ -210,22 +191,18 @@ def fetch_classroom(now):
     return items, calc_numbers, calc_dates
 
 
-# ---------- Wiki по Calculus 2 ----------
-
 def fetch_wiki():
-    """Домашки с wiki: во всех таблицах ищем столбец WIKI_GROUP с ссылками HW_N и датами."""
     resp = requests.get(WIKI_URL, timeout=20, headers=BROWSER_HEADERS)
     resp.raise_for_status()
     soup = BeautifulSoup(resp.text, "html.parser")
 
-    found = {}  # (номер, дата) -> домашка; ключ защищает от повторов
+    found = {}
     tables = soup.find_all("table")
     for table in tables:
-        col = None  # номер столбца нашей группы в этой таблице
+        col = None
         for row in table.find_all("tr"):
             cells = row.find_all(["th", "td"])
             if col is None:
-                # ищем строку-заголовок: ячейка, которая начинается с номера группы
                 col = next((i for i, c in enumerate(cells)
                             if c.get_text(strip=True).startswith(WIKI_GROUP)), None)
                 continue
@@ -236,12 +213,11 @@ def fetch_wiki():
                          if hw_number(a.get_text()) is not None), None)
             date = re.search(r"\((\d{1,2})\.(\d{1,2})\.(\d{2,4})\)", cell.get_text())
             if not link or not date:
-                continue  # домашка ещё не выложена
+                continue
             day, month, year = map(int, date.groups())
             if year < 100:
                 year += 2000
             title = link.get_text(strip=True)
-            # на wiki только дата; срок сдачи всегда 23:59
             due = datetime(year, month, day, 23, 59, tzinfo=TZ)
             found[(hw_number(title), due)] = {
                 "due": due, "course": WIKI_COURSE_NAME, "title": title,
@@ -249,7 +225,6 @@ def fetch_wiki():
             }
 
     if not found:
-        # на странице всегда есть хотя бы старые домашки; пусто = страница пришла не та
         with open("wiki_debug.html", "w", encoding="utf-8") as f:
             f.write(resp.text)
         raise RuntimeError(f"домашки не найдены: таблиц {len(tables)}, "
@@ -257,14 +232,11 @@ def fetch_wiki():
     return list(found.values())
 
 
-# ---------- SmartLMS ----------
-
 def fetch_smartlms():
-    """Все события из календаря SmartLMS: срок, код курса, название."""
     resp = requests.get(SMARTLMS_ICS, timeout=20, headers=BROWSER_HEADERS)
     resp.raise_for_status()
     resp.encoding = "utf-8"
-    text = re.sub(r"\r?\n[ \t]", "", resp.text)  # склеиваем перенесённые строки
+    text = re.sub(r"\r?\n[ \t]", "", resp.text)
     events = []
     for block in text.split("BEGIN:VEVENT")[1:]:
         props = {}
@@ -276,7 +248,6 @@ def fetch_smartlms():
         try:
             if "T" in start:
                 due = datetime.strptime(start[:15], "%Y%m%dT%H%M%S")
-                # время с буквой Z на конце записано в UTC
                 due = (due.replace(tzinfo=timezone.utc).astimezone(TZ)
                        if start.endswith("Z") else due.replace(tzinfo=TZ))
             else:
@@ -294,14 +265,11 @@ def smartlms_course(category):
                  if category.startswith(code)), None)
 
 
-# ---------- Дедлайны, добавленные вручную ----------
-
 MANUAL_FILE = os.path.join(DATA_DIR, "manual_deadlines.json")
 DATE_RE = re.compile(r"^(\d{1,2})\.(\d{1,2})(?:\.(\d{2,4}))?(?:\s+(\d{1,2}):(\d{2}))?$")
 
 
 def load_manual(now):
-    """Ручные дедлайны с будущим сроком, по порядку."""
     if not os.path.exists(MANUAL_FILE):
         return []
     with open(MANUAL_FILE, encoding="utf-8") as f:
@@ -316,7 +284,6 @@ def save_manual(entries):
 
 
 def parse_due(text, now):
-    """'12.10', '12.10 18:00', '12.10.2026 18:00' -> дата; без времени ставим 23:59."""
     m = DATE_RE.match(text.strip())
     if not m:
         return None
@@ -328,17 +295,14 @@ def parse_due(text, now):
         due = datetime(year, int(month), int(day),
                        int(hour) if hour else 23, int(minute) if minute else 59, tzinfo=TZ)
         if not m.group(3) and due < now:
-            due = due.replace(year=year + 1)  # дата без года уже прошла -> следующий год
+            due = due.replace(year=year + 1)
     except ValueError:
         return None
     return due
 
 
-# ---------- Задания из "тихих" чатов (ссылки на Яндекс Контест) ----------
-
 CONTESTS_FILE = os.path.join(DATA_DIR, "contests_seen.json")
 CONTEST_LINK_RE = re.compile(r"contest\.yandex\.(?:ru|com)/contest/(\d+)", re.IGNORECASE)
-# Слова, по которым контест считается домашним заданием (в названии контеста или в сообщении)
 HOMEWORK_RE = re.compile(
     r"(?<![a-zа-яё])(homework|home\s*work|hw|classwork|class\s*work|дз|домашн\w*|"
     r"классворк\w*|классн\w+\s+контест\w*)(?![a-zа-яё])",
@@ -354,12 +318,7 @@ RELATIVE_RE = re.compile(
 
 
 def find_date_in_text(text, now):
-    """Срок сдачи из текста сообщения: (дата, указано ли время) или (None, False).
-
-    Понимает '20.10', '20.10 в 18:00', 'через неделю', 'через 3 дня', 'завтра'.
-    Если в тексте несколько дат, берётся та, что стоит раньше.
-    """
-    found = []  # (позиция в тексте, дата, есть ли время)
+    found = []
     for m in TEXT_DATE_RE.finditer(text):
         day, month, year, hour, minute = m.groups()
         year = int(year) if year else now.year
@@ -389,7 +348,6 @@ def find_date_in_text(text, now):
 
 
 def to_datetime(value):
-    """Время из атрибута страницы: число секунд/миллисекунд или строка вида 2026-10-14T19:40:00Z."""
     value = (value or "").strip()
     try:
         if re.fullmatch(r"\d{13}", value):
@@ -405,10 +363,6 @@ def to_datetime(value):
 
 
 def fetch_contest_info(contest_id):
-    """Название и время окончания контеста со страницы входа (она видна без логина).
-
-    Возвращает (название или None, время окончания или None).
-    """
     url = f"https://contest.yandex.ru/contest/{contest_id}/enter/"
     resp = requests.get(url, timeout=20, headers=BROWSER_HEADERS)
     resp.raise_for_status()
@@ -418,9 +372,8 @@ def fetch_contest_info(contest_id):
     title = re.sub(r"\s*[—–-]\s*(Yandex\.?\s*Contest|Яндекс\.?\s*Контест)\s*$", "",
                    title.strip(), flags=re.IGNORECASE)
     if not title or "captcha" in title.lower() or "captcha" in str(getattr(resp, "url", "")).lower():
-        return None, None  # Яндекс показал проверку "я не робот" вместо страницы
+        return None, None
 
-    # На странице есть поля "начало" и "конец"; время лежит в тегах <time>
     times = []
     for tag in soup.find_all("time"):
         for attr in ("timestamp", "datetime", "data-timestamp", "data-time"):
@@ -429,15 +382,13 @@ def fetch_contest_info(contest_id):
                 times.append(dt)
                 break
     if not times:
-        # запасной вариант: ищем время окончания прямо в коде страницы
         for m in re.finditer(r'(?:end|finish)\w*"?\s*[:=]\s*"?(\d{13}|\d{4}-\d\d-\d\dT[\d:.]+Z?)',
                              resp.text, re.IGNORECASE):
             dt = to_datetime(m.group(1))
             if dt:
                 times.append(dt)
-    end = max(times) if times else None  # из "начала" и "конца" конец позже
+    end = max(times) if times else None
     if end is None:
-        # чтобы можно было разобраться, печатаем в логи кусок страницы возле слова "конец"
         pos = max(resp.text.find("конец"), resp.text.find(">end"))
         print(f"[контест {contest_id}] время окончания не найдено; фрагмент страницы: "
               f"{resp.text[max(pos - 300, 0):pos + 500]!r}", flush=True)
@@ -445,10 +396,6 @@ def fetch_contest_info(contest_id):
 
 
 def collect_contests(chat_id, text, links, now):
-    """Разбирает сообщение из тихого чата.
-
-    Возвращает (сколько заданий добавлено, список ссылок, про которые не удалось понять, дз это или нет).
-    """
     ids = []
     for m in CONTEST_LINK_RE.finditer(" ".join([text] + links)):
         if m.group(1) not in ids:
@@ -462,7 +409,7 @@ def collect_contests(chat_id, text, links, now):
     added, unknown = 0, []
     for cid in ids:
         if cid in seen:
-            continue  # этот контест уже разбирали
+            continue
         url = f"https://contest.yandex.ru/contest/{cid}/enter/"
         try:
             title, end = fetch_contest_info(cid)
@@ -475,15 +422,13 @@ def collect_contests(chat_id, text, links, now):
         seen.append(cid)
         if not is_homework:
             if title is None:
-                unknown.append(url)  # название узнать не удалось, а в тексте подсказок нет
+                unknown.append(url)
             continue
-        # срок: сначала время окончания со страницы контеста, потом дата из сообщения
         due, has_time = (end, True) if end and end >= now else find_date_in_text(text, now)
         entries = load_manual(now)
         entries.append({
             "course": SILENT_CHATS[chat_id], "title": title or f"Контест {cid}", "url": url,
             "contest_id": cid,
-            # если срока нигде нет, держим задание в списке NO_DUE_DAYS дней
             "due": (due or now + timedelta(days=NO_DUE_DAYS)).isoformat(),
             "no_due": due is None, "has_time": has_time,
         })
@@ -495,7 +440,6 @@ def collect_contests(chat_id, text, links, now):
 
 
 def refresh_contests(now):
-    """Перечитывает время окончания собранных контестов: вдруг преподаватель продлил дедлайн."""
     entries = load_manual(now)
     changed = False
     for e in entries:
@@ -515,11 +459,6 @@ def refresh_contests(now):
         save_manual(entries)
 
 
-# ---------- Дубликаты ----------
-
-# Разные названия одного предмета. Нужны, чтобы понять, что "Теорвер" из /add
-# и курс "Probability Theory..." из Classroom — это одно и то же.
-# Короткие слова (до 3 букв) должны совпасть с целым словом в названии, длинные — с его частью.
 SUBJECT_ALIASES = [
     ("теорвер", "тв", "твимс", "вероятн", "статист", "probab", "statist", "pts"),
     ("дискр", "дм", "dm", "discrete"),
@@ -533,7 +472,6 @@ SUBJECT_ALIASES = [
 
 
 def subject_id(name):
-    """Номер предмета по списку SUBJECT_ALIASES; если предмета там нет, само название."""
     name = name.lower().replace("ё", "е")
     words = re.findall(r"[a-zа-я]+", name)
     for i, group in enumerate(SUBJECT_ALIASES):
@@ -551,7 +489,6 @@ def same_subject(a, b):
 
 
 def is_duplicate(a, b):
-    """Одно и то же задание: тот же предмет и тот же номер дз (или, если номера нет, тот же день сдачи)."""
     if not same_subject(a["course"], b["course"]):
         return False
     na, nb = hw_number(a["title"]), hw_number(b["title"])
@@ -561,8 +498,6 @@ def is_duplicate(a, b):
         return False
     return a["due"].date() == b["due"].date()
 
-
-# ---------- Сводка ----------
 
 def fetch_deadlines(refresh=False):
     now = datetime.now(TZ)
@@ -575,7 +510,6 @@ def fetch_deadlines(refresh=False):
     try:
         items, calc_numbers, calc_dates = fetch_classroom(now)
     except Exception as e:
-        # Classroom недоступен: показываем остальные источники и предупреждение
         traceback.print_exc()
         items, calc_numbers, calc_dates = [], set(), set()
         warnings.append(f"⚠️ Не удалось прочитать Google Classroom ({type(e).__name__}: {str(e)[:150]})")
@@ -584,12 +518,11 @@ def fetch_deadlines(refresh=False):
         for item in fetch_wiki():
             if item["due"] < now:
                 continue
-            # домашка уже есть в Classroom -> не дублируем
             if item["number"] in calc_numbers or item["due"].date() in calc_dates:
                 continue
             items.append(item)
     except Exception as e:
-        traceback.print_exc()  # полный текст ошибки появится в Терминале
+        traceback.print_exc()
         warnings.append(f"⚠️ Не удалось прочитать wiki по Calculus 2 ({type(e).__name__}: {str(e)[:200]})")
 
     if SMARTLMS_ICS:
@@ -603,7 +536,6 @@ def fetch_deadlines(refresh=False):
                               "url": None, "has_time": True})
         except Exception as e:
             traceback.print_exc()
-            # текст ошибки не показываем: в нём может быть ссылка с секретным ключом
             warnings.append(f"⚠️ Не удалось прочитать календарь SmartLMS ({type(e).__name__})")
 
     for e in load_manual(now):
@@ -612,13 +544,10 @@ def fetch_deadlines(refresh=False):
                   "no_due": e.get("no_due", False)}
         twin = next((it for it in items if is_duplicate(it, manual)), None)
         if twin is not None:
-            # это задание уже пришло из Classroom/wiki/SmartLMS: ручную запись не показываем,
-            # а автоматическую считаем "тем же самым" дедлайном (чтобы не объявлять заново)
-            twin.setdefault("also_keys", []).append(item_key(manual))
+            twin.setdefault("also_keys", []).append(stable_key(manual))
             continue
         items.append(manual)
 
-    # задания без срока показываем в конце списка
     return sorted(items, key=lambda x: (x.get("no_due", False), x["due"])), "\n".join(warnings)
 
 
@@ -638,61 +567,122 @@ def format_item(it, today):
     return f"{escape(it['course'])} — {title}: {date} ({when})"
 
 
+def format_short(it, today, with_date):
+    title = escape(it["title"])
+    if it["url"]:
+        title = f'<a href="{escape(it["url"], quote=True)}">{title}</a>'
+    head = f"{escape(it['course'])} — {title}"
+    if it.get("no_due"):
+        return head
+    due = it["due"]
+    if not with_date:
+        return f"{head}: до {due:%H:%M}" if it["has_time"] else head
+    date = f"{due:%d.%m %H:%M}" if it["has_time"] else f"{due:%d.%m}"
+    return f"{head}: {date} (через {(due.date() - today).days} дн.)"
+
+
+DIGEST_SECTIONS = [
+    ("Сегодня", lambda d: d <= 0, False),
+    ("Завтра", lambda d: d == 1, False),
+    ("Ближайшие 7 дней", lambda d: 2 <= d <= 7, True),
+    ("Позже", lambda d: d > 7, True),
+]
+
+
 def format_digest(items, warning=None):
     today = datetime.now(TZ).date()
-    lines = [f"<b>Учёба · сроки на {today:%d.%m.%Y}</b>", ""]
+    lines = [f"<b>Учёба · сроки на {today:%d.%m.%Y}</b>"]
     if not items:
-        lines.append("Активных дедлайнов нет 🎉")
-    for it in items:
-        lines.append(format_item(it, today) + "\n")
+        lines += ["", "Активных дедлайнов нет 🎉"]
+    for title, fits, with_date in DIGEST_SECTIONS:
+        part = [it for it in items
+                if not it.get("no_due") and fits((it["due"].date() - today).days)]
+        if part:
+            lines += ["", f"<b>{title}</b>"] + ["• " + format_short(it, today, with_date) for it in part]
+    no_due = [it for it in items if it.get("no_due")]
+    if no_due:
+        lines += ["", "<b>Срок не указан</b>"] + ["• " + format_short(it, today, True) for it in no_due]
     if warning:
-        lines.append(escape(warning))
+        lines += ["", escape(warning)]
     return "\n".join(lines)
 
-
-# ---------- Новые дедлайны ----------
 
 SEEN_FILE = os.path.join(DATA_DIR, "seen_deadlines.json")
 
 
-def item_key(it):
-    """Ключ, по которому бот помнит, что об этом дедлайне уже сообщал."""
+def stable_key(it):
     if it.get("number") is not None:
-        # домашка по Calculus: wiki и Classroom считаются одной и той же
         return f"calc:{it['number']}"
-    if it.get("no_due"):
-        return f"{it['course']}|{it['title']}|без срока"
-    return f"{it['course']}|{it['title']}|{it['due'].isoformat()}"
+    return f"{it['course']}|{it['title']}"
 
 
-def find_new(items, now):
-    """Возвращает дедлайны, которых не было при прошлой проверке, и запоминает текущие."""
-    first_run = not os.path.exists(SEEN_FILE)
+def item_key(it):
+    due = "без срока" if it.get("no_due") else it["due"].isoformat()
+    return f"{stable_key(it)}|{due}"
+
+
+def due_value(it):
+    return None if it.get("no_due") else it["due"].isoformat()
+
+
+def load_seen(now):
+    if not os.path.exists(SEEN_FILE):
+        return None
+    with open(SEEN_FILE, encoding="utf-8") as f:
+        raw = json.load(f)
     seen = {}
-    if not first_run:
-        with open(SEEN_FILE, encoding="utf-8") as f:
-            seen = json.load(f)
-    new = [it for it in items
-           if item_key(it) not in seen and not any(k in seen for k in it.get("also_keys", []))]
-    for it in items:
-        seen[item_key(it)] = it["due"].isoformat()
-    # забываем то, что давно прошло, чтобы файл не рос
+    for key, value in raw.items():
+        if isinstance(value, dict):
+            seen[key] = value
+            continue
+        if key.startswith("calc:"):
+            seen[key] = {"due": value, "keep": value}
+        else:
+            base, _, due = key.rpartition("|")
+            record = {"due": None if due == "без срока" else value, "keep": value}
+            seen[key] = record
+            seen.setdefault(base, record)
+    return seen
+
+
+def save_seen(seen, now):
     limit = now - timedelta(days=2)
-    seen = {k: v for k, v in seen.items() if datetime.fromisoformat(v) >= limit}
+    seen = {k: v for k, v in seen.items() if datetime.fromisoformat(v["keep"]) >= limit}
     with open(SEEN_FILE, "w", encoding="utf-8") as f:
         json.dump(seen, f, ensure_ascii=False, indent=2)
-    # при самом первом запуске ничего не рассылаем: всё и так "новое"
-    return [] if first_run else new
 
 
-# ---------- Telegram ----------
+def keys_for(items):
+    counts = {}
+    for it in items:
+        counts[stable_key(it)] = counts.get(stable_key(it), 0) + 1
+    return [stable_key(it) if counts[stable_key(it)] == 1 else item_key(it) for it in items]
+
+
+def find_changes(items, now):
+    seen = load_seen(now)
+    first_run = seen is None
+    seen = seen or {}
+    new, changed = [], []
+    for it, key in zip(items, keys_for(items)):
+        record = seen.get(key)
+        twin_record = next((seen[k] for k in it.get("also_keys", []) if k in seen), None)
+        if record is None and twin_record is not None:
+            old = twin_record["due"]
+            if old and not it.get("no_due") and \
+                    datetime.fromisoformat(old).date() != it["due"].date():
+                changed.append((it, old))
+        elif record is None:
+            new.append(it)
+        elif record["due"] != due_value(it):
+            changed.append((it, record["due"]))
+        keep = it["due"].isoformat()
+        seen[key] = {"due": due_value(it), "keep": keep}
+    save_seen(seen, now)
+    return ([], []) if first_run else (new, changed)
+
 
 class SafeBot(Bot):
-    """Бот с предохранителем: в группы, которых нет в CHAT_ID, не уходит НИ ОДНО сообщение.
-
-    Проверка стоит на самом нижнем уровне, через неё проходит любая отправка,
-    поэтому ошибка в остальном коде не может привести к сообщению в чужой чат.
-    """
 
     async def __call__(self, method, *args, **kwargs):
         chat_id = getattr(method, "chat_id", None)
@@ -708,38 +698,50 @@ SEND_OPTIONS = {"parse_mode": "HTML", "disable_web_page_preview": True}
 
 
 async def build_digest():
-    # Запросы к Google и wiki синхронные, поэтому запускаем их в отдельном потоке
     items, warning = await asyncio.to_thread(fetch_deadlines)
     return format_digest(items, warning)
 
 
 def greeting(chat_id):
-    """Приветствие со списком команд, доступных в этом чате."""
     lines = ["Привет, я бот, который сообщает о предстоящих дедлайнах. "
              "Вот список моих команд:", ""]
     if PUBLIC_DEADLINES or chat_id in CHAT_IDS:
         lines.append("/deadlines — показать предстоящие дедлайны")
     if chat_id in CHAT_IDS:
-        lines.append("/add Предмет | Задание | 12.10 23:59 — добавить дедлайн вручную")
+        admins_note = " (только админы чата)" if ADMINS_ONLY and chat_id < 0 else ""
+        lines.append("")
+        lines.append(f"Изменение списка{admins_note}:")
+        lines.append("/add Предмет | Задание | 12.10 23:59 | ссылка — добавить дедлайн вручную "
+                     "(ссылку можно не писать)")
+        lines.append("/muteadd — то же самое, но без объявления в чатах")
         lines.append("/del — посмотреть и удалить добавленные вручную дедлайны")
+        lines.append("/due 1 15.10 23:59 — изменить срок добавленного вручную дедлайна")
+        lines.append("/link 1 https://... — добавить ссылку к добавленному вручную дедлайну")
+        lines.append("")
+    lines.append("/about — как я устроен и где мой код")
     lines.append("/help — показать это сообщение ещё раз")
     if chat_id in CHAT_IDS:
         lines.append("")
-        lines.append("Когда появляется новый дедлайн, я сам пишу об этом сюда "
-                     "и показываю обновлённый список.")
+        lines.append("Когда появляется новый дедлайн или меняется срок сдачи, "
+                     "я сам пишу об этом сюда и показываю обновлённый список.")
+    if REPO_URL:
+        lines.append("")
+        lines.append(f"Описание и исходный код: {REPO_URL}")
     return "\n".join(lines)
 
 
-def can_write(chat):
-    """Можно ли писать в этот чат: в личку да, в группы только из CHAT_ID.
+def about_text():
+    return ("Я собираю дедлайны по домашкам из Google Classroom, SmartLMS, wiki и чатов "
+            "преподавателей в один список и сообщаю о новых заданиях.\n\n"
+            f"Как я устроен, список возможностей и исходный код: {REPO_URL}\n"
+            "Там же есть инструкция, как сделать такого бота для своей группы.")
 
-    В тихих и незнакомых группах бот не пишет никогда, даже в ответ на команды.
-    """
+
+def can_write(chat):
     return chat.type == "private" or chat.id in CHAT_IDS
 
 
 async def tell_owner(text):
-    """Служебное сообщение владельцу бота в личку."""
     if OWNER_ID:
         try:
             await bot.send_message(OWNER_ID, text)
@@ -758,24 +760,27 @@ def new_chat_note(chat):
 @dp.message(Command("start", "help"))
 async def cmd_start(message: Message):
     if can_write(message.chat):
-        await message.answer(greeting(message.chat.id))
+        await message.answer(greeting(message.chat.id), disable_web_page_preview=True)
 
 
 @dp.my_chat_member(ChatMemberUpdatedFilter(JOIN_TRANSITION))
 async def on_added_to_chat(event: ChatMemberUpdated):
-    """Бота добавили в групповой чат."""
     if event.chat.type not in ("group", "supergroup"):
         return
     if event.chat.id in CHAT_IDS:
         await bot.send_message(event.chat.id, greeting(event.chat.id))
     elif event.chat.id not in SILENT_CHATS:
-        # незнакомый чат: в сам чат не пишем, id сообщаем владельцу в личку
         await tell_owner("Меня добавили в новый чат.\n" + new_chat_note(event.chat))
+
+
+@dp.message(Command("about"))
+async def cmd_about(message: Message):
+    if can_write(message.chat):
+        await message.answer(about_text(), disable_web_page_preview=True)
 
 
 @dp.message(Command("id"))
 async def cmd_id(message: Message):
-    # нужен владельцу бота, чтобы добавить чат в CHAT_ID или SILENT_CHATS
     if can_write(message.chat):
         await message.answer(f"Chat id этого чата: {message.chat.id}")
     elif message.chat.id not in SILENT_CHATS:
@@ -785,28 +790,100 @@ async def cmd_id(message: Message):
 @dp.message(Command("deadlines"))
 async def cmd_deadlines(message: Message):
     if not can_write(message.chat):
-        return  # в тихих и незнакомых группах не пишем
+        return
     if not PUBLIC_DEADLINES and message.chat.id not in CHAT_IDS:
-        return  # чужим чатам бот не отвечает
+        return
     await message.answer(await build_digest(), **SEND_OPTIONS)
 
 
-ADD_HELP = ("Формат: /add Предмет | Задание | 12.10 23:59\n"
-            "Время можно не писать, тогда будет 23:59.")
+ADD_HELP = ("Формат: /add Предмет | Задание | 12.10 23:59 | ссылка\n"
+            "Время можно не писать, тогда будет 23:59. Ссылку тоже можно не писать.\n"
+            "Ссылку можно и спрятать прямо в название задания через форматирование Telegram.\n"
+            "/muteadd с тем же форматом добавляет дедлайн без объявления в чатах.")
+URL_RE = re.compile(r"https?://[^\s|]+", re.IGNORECASE)
+
+
+def split_add_args(message: Message, args: str):
+    args = re.sub(r"^\s*(?:/\w+(?:@\w+)?\s+)+", "", args)
+    url = None
+    found = URL_RE.search(args)
+    if found:
+        url = found.group(0).rstrip(".,;)")
+        args = URL_RE.sub("", args)
+    if url is None:
+        for entity in getattr(message, "entities", None) or []:
+            if entity.type == "text_link" and entity.url:
+                url = entity.url
+                break
+    parts = [p.strip() for p in args.split("|")]
+    while len(parts) > 3 and not parts[-1]:
+        parts.pop()
+    if len(parts) != 3:
+        return None
+    course, title, date_text = parts
+    return course, title, date_text, url
+
+
+def mark_seen(item):
+    now = datetime.now(TZ)
+    seen = load_seen(now) or {}
+    seen[stable_key(item)] = {"due": due_value(item), "keep": item["due"].isoformat()}
+    save_seen(seen, now)
+
+
+_admin_cache = {}
+
+
+async def can_edit(message: Message):
+    if message.chat.id not in CHAT_IDS:
+        return False
+    if not ADMINS_ONLY:
+        return True
+    user_id = message.from_user.id if message.from_user else None
+    if message.chat.type == "private":
+        return user_id == OWNER_ID
+    if user_id == OWNER_ID:
+        return True
+    if message.sender_chat and message.sender_chat.id == message.chat.id:
+        return True
+    cached = _admin_cache.get(message.chat.id)
+    if cached is None or (datetime.now(TZ) - cached[0]).total_seconds() > 600:
+        try:
+            admins = await bot.get_chat_administrators(message.chat.id)
+            cached = (datetime.now(TZ), {m.user.id for m in admins})
+            _admin_cache[message.chat.id] = cached
+        except Exception:
+            traceback.print_exc()
+            cached = (datetime.now(TZ), set())
+    if user_id in cached[1]:
+        return True
+    await message.answer("Добавлять и менять дедлайны могут только админы чата. "
+                         "Если заметил новую домашку, напиши старосте или заму.")
+    return False
 
 
 @dp.message(Command("add"))
 async def cmd_add(message: Message, command: CommandObject):
-    if message.chat.id not in CHAT_IDS:
+    await add_deadline(message, command, announce=True)
+
+
+@dp.message(Command("muteadd"))
+async def cmd_muteadd(message: Message, command: CommandObject):
+    await add_deadline(message, command, announce=False)
+
+
+async def add_deadline(message: Message, command: CommandObject, announce: bool):
+    if not await can_edit(message):
         return
     now = datetime.now(TZ)
-    parts = [p.strip() for p in (command.args or "").split("|")]
-    due = parse_due(parts[2], now) if len(parts) == 3 else None
-    if due is None or not parts[0] or not parts[1]:
+    parsed = split_add_args(message, command.args or "")
+    due = parse_due(parsed[2], now) if parsed else None
+    if due is None or not parsed[0] or not parsed[1]:
         await message.answer(ADD_HELP)
         return
-    # проверяем, нет ли уже такого дедлайна в списке
-    candidate = {"course": parts[0], "title": parts[1], "due": due}
+    course, title, _, url = parsed
+    parts = [course, title]
+    candidate = {"course": course, "title": title, "due": due}
     try:
         items, _ = await asyncio.to_thread(fetch_deadlines)
         twin = next((it for it in items if is_duplicate(it, candidate)), None)
@@ -818,25 +895,54 @@ async def cmd_add(message: Message, command: CommandObject):
                              + format_item(twin, now.date()), **SEND_OPTIONS)
         return
     entries = load_manual(now)
-    entries.append({"course": parts[0], "title": parts[1], "due": due.isoformat()})
+    entry = {"course": course, "title": title, "due": due.isoformat()}
+    if url:
+        entry["url"] = url
+    entries.append(entry)
+    link_note = " (со ссылкой)" if url else ""
+    if not announce:
+        async with check_lock:
+            save_manual(entries)
+            mark_seen(candidate)
+        await message.answer(f"Добавлено без объявления: {course} — {title}: "
+                             f"{due:%d.%m.%Y %H:%M}{link_note}")
+        return
     save_manual(entries)
     try:
-        await check_new_deadlines()  # сразу рассылаем новость и обновлённый список
+        await check_new_deadlines()
     except Exception:
         traceback.print_exc()
-        await message.answer(f"Добавлено: {parts[0]} — {parts[1]}: {due:%d.%m.%Y %H:%M}")
+        await message.answer(f"Добавлено: {course} — {title}: {due:%d.%m.%Y %H:%M}{link_note}")
+
+
+@dp.message(Command("link"))
+async def cmd_link(message: Message, command: CommandObject):
+    if not await can_edit(message):
+        return
+    now = datetime.now(TZ)
+    entries = load_manual(now)
+    number, _, rest = (command.args or "").strip().partition(" ")
+    found = URL_RE.search(rest)
+    if not number.isdigit() or not 1 <= int(number) <= len(entries) or not found:
+        await message.answer("Формат: /link номер ссылка\nНомера смотри в списке /del.")
+        return
+    e = entries[int(number) - 1]
+    e["url"] = found.group(0).rstrip(".,;)")
+    save_manual(entries)
+    await message.answer(f"Ссылка добавлена: {e['course']} — {e['title']}")
 
 
 def describe_entry(e):
+    link = " (есть ссылка)" if e.get("url") else ""
     if e.get("no_due"):
-        return f"{e['course']} — {e['title']}: срок не указан"
+        return f"{e['course']} — {e['title']}: срок не указан{link}"
     fmt = "%d.%m.%Y %H:%M" if e.get("has_time", True) else "%d.%m.%Y"
-    return f"{e['course']} — {e['title']}: {datetime.fromisoformat(e['due']).strftime(fmt)}"
+    return f"{e['course']} — {e['title']}: {datetime.fromisoformat(e['due']).strftime(fmt)}{link}"
 
 
 @dp.message(Command("del"))
 async def cmd_del(message: Message, command: CommandObject):
-    if message.chat.id not in CHAT_IDS:
+    if not await can_edit(message):
         return
     entries = load_manual(datetime.now(TZ))
     arg = (command.args or "").strip()
@@ -854,13 +960,13 @@ async def cmd_del(message: Message, command: CommandObject):
     lines.append("")
     lines.append("Удалить: /del 1")
     lines.append("Изменить срок: /due 1 12.10 23:59")
+    lines.append("Добавить ссылку: /link 1 https://...")
     await message.answer("\n".join(lines))
 
 
 @dp.message(Command("due"))
 async def cmd_due(message: Message, command: CommandObject):
-    """/due 2 15.10 23:59: задаёт срок дедлайну номер 2 из списка /del."""
-    if message.chat.id not in CHAT_IDS:
+    if not await can_edit(message):
         return
     now = datetime.now(TZ)
     entries = load_manual(now)
@@ -873,14 +979,13 @@ async def cmd_due(message: Message, command: CommandObject):
     e["due"], e["no_due"], e["has_time"] = due.isoformat(), False, True
     save_manual(entries)
     try:
-        await check_new_deadlines()  # рассылаем обновлённый список
+        await check_new_deadlines()
     except Exception:
         traceback.print_exc()
         await message.answer(f"Срок изменён: {describe_entry(e)}")
 
 
 def debug_info():
-    """Служебная информация: какие курсы бот видит и что нашёл на wiki."""
     svc = get_service()
     lines = ["Курсы в Classroom:"]
     for course in list_all(svc.courses().list, "courses",
@@ -929,7 +1034,6 @@ REPORTED_FILE = os.path.join(DATA_DIR, "reported_chats.json")
 
 
 async def report_unknown_chat(chat):
-    """Незнакомая группа: один раз сообщаем владельцу её id в личку. В саму группу не пишем."""
     if chat.type == "private" or chat.id in CHAT_IDS:
         return
     reported = []
@@ -944,15 +1048,115 @@ async def report_unknown_chat(chat):
     await tell_owner("Я нахожусь в чате, которого нет в настройках.\n" + new_chat_note(chat))
 
 
+BACKUP_FORMAT = "deadline-bot-backup"
+BACKUP_HASH_FILE = os.path.join(DATA_DIR, "last_backup_hash.txt")
+
+
+def read_json(path, default):
+    if not os.path.exists(path):
+        return default
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def make_backup():
+    data = {
+        "format": BACKUP_FORMAT,
+        "created": datetime.now(TZ).isoformat(timespec="minutes"),
+        "manual_deadlines": read_json(MANUAL_FILE, []),
+        "contests_seen": read_json(CONTESTS_FILE, []),
+    }
+    content = {k: data[k] for k in ("manual_deadlines", "contests_seen")}
+    digest = hashlib.sha256(json.dumps(content, sort_keys=True).encode()).hexdigest()
+    return json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8"), digest
+
+
+async def send_backup(force=False):
+    if not OWNER_ID:
+        return
+    payload, digest = make_backup()
+    last = open(BACKUP_HASH_FILE).read().strip() if os.path.exists(BACKUP_HASH_FILE) else ""
+    if not force and digest == last:
+        return
+    name = f"deadlines_backup_{datetime.now(TZ):%Y-%m-%d}.json"
+    count = len(json.loads(payload)["manual_deadlines"])
+    await bot.send_document(
+        OWNER_ID, BufferedInputFile(payload, filename=name),
+        caption=(f"Резервная копия: дедлайнов, добавленных вручную и из чатов, — {count}.\n"
+                 "Если данные на сервере пропадут, просто перешли этот файл мне."))
+    with open(BACKUP_HASH_FILE, "w") as f:
+        f.write(digest)
+
+
+async def scheduled_backup():
+    try:
+        await send_backup()
+    except Exception:
+        traceback.print_exc()
+
+
+@dp.message(Command("backup"))
+async def cmd_backup(message: Message):
+    if message.chat.type == "private" and message.from_user and message.from_user.id == OWNER_ID:
+        await send_backup(force=True)
+
+
+def restore_backup(data):
+    if not isinstance(data, dict) or data.get("format") != BACKUP_FORMAT:
+        raise ValueError("это не файл резервной копии бота")
+    now = datetime.now(TZ)
+    entries = load_manual(now)
+    known = {(e["course"], e["title"]) for e in entries}
+    added = []
+    for e in data.get("manual_deadlines", []):
+        if (e.get("course"), e.get("title")) in known:
+            continue
+        if datetime.fromisoformat(e["due"]) < now:
+            continue
+        entries.append(e)
+        known.add((e["course"], e["title"]))
+        added.append(e)
+    save_manual(entries)
+    seen = set(read_json(CONTESTS_FILE, [])) | set(data.get("contests_seen", []))
+    with open(CONTESTS_FILE, "w", encoding="utf-8") as f:
+        json.dump(sorted(seen), f)
+    for e in added:
+        mark_seen({"course": e["course"], "title": e["title"],
+                   "due": datetime.fromisoformat(e["due"]), "no_due": e.get("no_due", False)})
+    return added
+
+
+@dp.message(F.document & (F.chat.type == "private"))
+async def on_document(message: Message):
+    if not message.from_user or message.from_user.id != OWNER_ID:
+        return
+    if not (message.document.file_name or "").endswith(".json"):
+        await message.answer("Чтобы восстановить дедлайны, пришли файл резервной копии (.json).")
+        return
+    try:
+        buffer = await bot.download(message.document)
+        data = json.loads(buffer.read().decode("utf-8"))
+        async with check_lock:
+            added = await asyncio.to_thread(restore_backup, data)
+    except Exception as e:
+        traceback.print_exc()
+        await message.answer(f"Не получилось восстановить: {e}")
+        return
+    if added:
+        lines = [f"Восстановлено дедлайнов: {len(added)}"] + [f"• {describe_entry(e)}" for e in added]
+    else:
+        lines = ["Нечего восстанавливать: все дедлайны из файла уже есть в списке или их срок прошёл."]
+    await message.answer("\n".join(lines))
+
+
 @dp.message()
 async def on_any_message(message: Message):
-    """Любое другое сообщение. В тихих чатах ищем ссылки на контесты; сами ничего не пишем."""
     if message.chat.id not in SILENT_CHATS:
         await report_unknown_chat(message.chat)
         return
     text = message.text or message.caption or ""
     entities = message.entities or message.caption_entities or []
-    links = [e.url for e in entities if e.type == "text_link" and e.url]  # ссылки, спрятанные в текст
+    links = [e.url for e in entities if e.type == "text_link" and e.url]
     added, unknown = await asyncio.to_thread(
         collect_contests, message.chat.id, text, links, datetime.now(TZ))
     for url in unknown:
@@ -960,14 +1164,13 @@ async def on_any_message(message: Message):
                          f"но я не смог узнать его название: {url}\n"
                          "Если это домашка, добавь её через /add.")
     if added:
-        await scheduled_check()  # рассылаем новость в чаты из CHAT_ID
+        await scheduled_check()
 
 
 GREETED_FILE = os.path.join(DATA_DIR, "greeted_chats.json")
 
 
 async def greet_new_chats():
-    """Здоровается в групповых чатах, которые только что добавили в CHAT_ID."""
     greeted = []
     if os.path.exists(GREETED_FILE):
         with open(GREETED_FILE, encoding="utf-8") as f:
@@ -986,19 +1189,51 @@ async def greet_new_chats():
 check_lock = asyncio.Lock()
 
 
+def describe_shift(old, new):
+    delta = new - old
+    word = "продлён" if delta.total_seconds() > 0 else "сокращён"
+    minutes = round(abs(delta.total_seconds()) / 60)
+    if minutes < 60:
+        return f"{word} на {minutes} мин"
+    days, hours = divmod(round(minutes / 60), 24)
+    parts = ([f"{days} дн."] if days else []) + ([f"{hours} ч"] if hours else [])
+    return f"{word} на {' '.join(parts)}"
+
+
+def format_change(it, old):
+    title = escape(it["title"])
+    if it["url"]:
+        title = f'<a href="{escape(it["url"], quote=True)}">{title}</a>'
+    head = f"{escape(it['course'])} — {title}"
+    if it.get("no_due"):
+        return f"{head}: срок теперь не указан"
+    fmt = "%d.%m.%Y %H:%M" if it["has_time"] else "%d.%m.%Y"
+    new_text = it["due"].strftime(fmt)
+    if old is None:
+        return f"{head}: срок назначен — {new_text}"
+    old_dt = datetime.fromisoformat(old)
+    return (f"{head}: было {old_dt.strftime(fmt)}, стало <b>{new_text}</b> "
+            f"({describe_shift(old_dt, it['due'])})")
+
+
 async def check_new_deadlines():
-    """Проверяет источники; если появились новые дедлайны, пишет во все чаты из CHAT_ID."""
     async with check_lock:
         items, warning = await asyncio.to_thread(fetch_deadlines, True)
         now = datetime.now(TZ)
-        new = find_new(items, now)
-        print(f"[{now:%d.%m %H:%M}] проверка: дедлайнов в списке {len(items)}, новых {len(new)}",
-              flush=True)
-        if not new:
+        new, changed = find_changes(items, now)
+        print(f"[{now:%d.%m %H:%M}] проверка: дедлайнов в списке {len(items)}, "
+              f"новых {len(new)}, изменённых {len(changed)}", flush=True)
+        if not new and not changed:
             return
-        head = "🆕 <b>Новый дедлайн</b>" if len(new) == 1 else "🆕 <b>Новые дедлайны</b>"
-        lines = [head] + [format_item(it, now.date()) for it in new]
-        text = "\n".join(lines) + "\n\n" + format_digest(items, warning)
+        parts = []
+        if new:
+            head = "🆕 <b>Новый дедлайн</b>" if len(new) == 1 else "🆕 <b>Новые дедлайны</b>"
+            parts.append("\n".join([head] + [format_item(it, now.date()) for it in new]))
+        if changed:
+            head = ("🔄 <b>Изменение срока сдачи</b>" if len(changed) == 1
+                    else "🔄 <b>Изменения сроков сдачи</b>")
+            parts.append("\n".join([head] + [format_change(it, old) for it, old in changed]))
+        text = "\n\n".join(parts) + "\n\n" + format_digest(items, warning)
         for chat_id in CHAT_IDS:
             await bot.send_message(chat_id, text, **SEND_OPTIONS)
 
@@ -1007,31 +1242,35 @@ async def scheduled_check():
     try:
         await check_new_deadlines()
     except Exception:
-        traceback.print_exc()  # например, пропал интернет; попробуем в следующий раз
+        traceback.print_exc()
 
 
 async def main():
     try:
-        get_service()  # вход в Google при первом запуске
+        get_service()
     except Exception:
         traceback.print_exc()
     scheduler = AsyncIOScheduler(timezone=TZ)
     scheduler.add_job(scheduled_check, "interval", minutes=CHECK_MINUTES,
                       misfire_grace_time=300, coalesce=True)
+    scheduler.add_job(scheduled_backup, "cron", hour=BACKUP_HOUR,
+                      misfire_grace_time=3600, coalesce=True)
     scheduler.start()
-    # подсказки команд в меню Telegram (кнопка "/" в чате)
     await bot.set_my_commands([
         BotCommand(command="deadlines", description="Предстоящие дедлайны"),
         BotCommand(command="add", description="Добавить дедлайн вручную"),
+        BotCommand(command="muteadd", description="Добавить дедлайн без объявления"),
         BotCommand(command="del", description="Список добавленных дедлайнов и удаление"),
         BotCommand(command="due", description="Изменить срок добавленного дедлайна"),
+        BotCommand(command="link", description="Добавить ссылку к добавленному дедлайну"),
+        BotCommand(command="about", description="О боте и исходный код"),
         BotCommand(command="help", description="Список команд"),
     ])
-    print(f"Версия бота: тихие чаты + предохранитель. Пишу только в: {sorted(CHAT_IDS)}; "
+    print(f"Версия бота: тихие чаты + предохранитель + бэкапы. Пишу только в: {sorted(CHAT_IDS)}; "
           f"молча читаю: {sorted(SILENT_CHATS)}", flush=True)
     await greet_new_chats()
-    await scheduled_check()  # первая проверка сразу при запуске
-    await bot.delete_webhook()  # на случай, если хостинг включил webhook: мы работаем через polling
+    await scheduled_check()
+    await bot.delete_webhook()
     await dp.start_polling(bot)
 
 
